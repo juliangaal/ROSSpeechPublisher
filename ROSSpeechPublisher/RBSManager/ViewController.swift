@@ -8,17 +8,27 @@
 
 import UIKit
 import RBSManager
+import Speech
 
 class ViewController: UIViewController, RBSManagerDelegate {
     // user interface
-    @IBOutlet var toolbar: UIToolbar!
-    @IBOutlet var connectButton: UIButton!
-    @IBOutlet var backgroundButton: UIButton!
+    @IBOutlet weak var toolbar: UIToolbar!
+    @IBOutlet weak var connectButton: UIButton!
+    @IBOutlet weak var recordButton: UIButton!
+    @IBOutlet weak var connStatusView: UILabel!
+    @IBOutlet weak var recordTextView: UILabel!
+    
     var hostButton: UIBarButtonItem?
     var flexibleToolbarSpace: UIBarButtonItem?
-    
     var stringManager: RBSManager?
     var stringPublisher: RBSPublisher?
+    
+    // speech
+    private var speechRecognizer = SFSpeechRecognizer(locale: Locale.init(identifier: "en-US")) //1
+    private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
+    private var recognitionTask: SFSpeechRecognitionTask?
+    private var audioEngine = AVAudioEngine()
+    var lang: String = "en-US"
     
     // sending message timer
     var controlTimer: Timer?
@@ -29,8 +39,6 @@ class ViewController: UIViewController, RBSManagerDelegate {
     override func viewDidLoad() {
         super.viewDidLoad()
         self.edgesForExtendedLayout = []
-        stringManager = RBSManager.sharedManager()
-        stringManager?.delegate = self
         updateButtonStates(false)
         
         // load settings to retrieve the stored host value
@@ -40,8 +48,40 @@ class ViewController: UIViewController, RBSManagerDelegate {
         hostButton = UIBarButtonItem(title: "Host", style: .plain, target: self, action: #selector(onHostButton))
         flexibleToolbarSpace = UIBarButtonItem(barButtonSystemItem: .flexibleSpace, target: nil, action: nil)
         updateToolbarItems()
+
+        // request mic permission
+        recordButton.isEnabled = false  //2
+        speechRecognizer?.delegate = self as? SFSpeechRecognizerDelegate  //3
+        speechRecognizer = SFSpeechRecognizer(locale: Locale.init(identifier: lang))
+        SFSpeechRecognizer.requestAuthorization { (authStatus) in  //4
+            
+            var isButtonEnabled = false
+            
+            switch authStatus {  //5
+            case .authorized:
+                isButtonEnabled = true
+                
+            case .denied:
+                isButtonEnabled = false
+                print("User denied access to speech recognition")
+                
+            case .restricted:
+                isButtonEnabled = false
+                print("Speech recognition restricted on this device")
+                
+            case .notDetermined:
+                isButtonEnabled = false
+                print("Speech recognition not yet authorized")
+            }
+            
+            OperationQueue.main.addOperation() {
+                self.recordButton.isEnabled = isButtonEnabled
+            }
+        }
         
-        // create the publisher and subscriber
+        // create the publisher
+        stringManager = RBSManager.sharedManager()
+        stringManager?.delegate = self
         stringPublisher = stringManager?.addPublisher(topic: "/phone/instruction", messageType: "sensor_msgs/String", messageClass: StringMessage.self)
     }
 
@@ -100,21 +140,22 @@ class ViewController: UIViewController, RBSManagerDelegate {
     
     @IBAction func onConnectButton() {
         if stringManager?.connected == true {
+            connStatusView.text = ""
             stringManager?.disconnect()
         } else {
             if socketHost != nil {
                 // the manager will produce a delegate error if the socket host is invalid
                 stringManager?.connect(address: socketHost!)
+                connStatusView.text = "Connected to ROS Master at " + socketHost!
             } else {
                 // print log error
-                print("Missing socket host value --> use host button")
+                connStatusView.text = "Missing socket host value --> use host button"
             }
         }
     }
     
     // update interface for the different connection statuses
     func updateButtonStates(_ connected: Bool) {
-        
         if connected {
             let redColor = UIColor(red: 0.729, green: 0.131, blue: 0.144, alpha: 1.0)
             connectButton.backgroundColor = redColor
@@ -126,6 +167,20 @@ class ViewController: UIViewController, RBSManagerDelegate {
         }
     }
     
+    // update record button
+    func updateRecordButton(_ recording: Bool) {
+        if recording {
+            let yellowColor = UIColor(red: 0.255, green: 0.255, blue: 0.0, alpha: 1.0)
+            recordButton.backgroundColor = yellowColor
+            recordButton.setTitle("STOP RECORDING", for: .normal)
+        } else {
+            let greenColor = UIColor(red: 0.329, green: 0.729, blue: 0.273, alpha: 1.0)
+            recordButton.backgroundColor = greenColor
+            recordButton.setTitle("RECORD", for: .normal)
+            self.recordTextView.text = ""
+        }
+    }
+    
     func updateToolbarItems() {
         if stringManager?.connected == true {
             toolbar.setItems([], animated: false)
@@ -133,5 +188,99 @@ class ViewController: UIViewController, RBSManagerDelegate {
             toolbar.setItems([flexibleToolbarSpace!, hostButton!], animated: false)
         }
     }
+    
+    @IBAction func onRecordButton(_ sender: Any) {
+        speechRecognizer = SFSpeechRecognizer(locale: Locale.init(identifier: lang))
+        
+        if audioEngine.isRunning {
+            audioEngine.stop()
+            recognitionRequest?.endAudio()
+            recordButton.isEnabled = false
+            updateRecordButton(false)
+        } else {
+            startRecording()
+            updateRecordButton(true)
+        }
+    }
+    
+    func startRecording() {
+        
+        if recognitionTask != nil {
+            recognitionTask?.cancel()
+            recognitionTask = nil
+        }
+        
+        let audioSession = AVAudioSession.sharedInstance()
+        do {
+            try audioSession.setCategory(AVAudioSessionCategoryRecord)
+            try audioSession.setMode(AVAudioSessionModeMeasurement)
+            try audioSession.setActive(true, with: .notifyOthersOnDeactivation)
+        } catch {
+            print("audioSession properties weren't set because of an error.")
+        }
+        
+        recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
+        
+        let inputNode = audioEngine.inputNode
+        
+        guard let recognitionRequest = recognitionRequest else {
+            fatalError("Unable to create an SFSpeechAudioBufferRecognitionRequest object")
+        }
+        
+        recognitionRequest.shouldReportPartialResults = true
+        
+        recognitionTask = speechRecognizer?.recognitionTask(with: recognitionRequest, resultHandler: { (result, error) in
+            
+            var isFinal = false
+            
+            if result != nil {
+                
+                self.recordTextView.text = result?.bestTranscription.formattedString
+                isFinal = (result?.isFinal)!
+                
+                self.sendStringMessage(message: self.recordTextView.text!)
+            }
+            
+            if error != nil || isFinal {
+                self.audioEngine.stop()
+                inputNode.removeTap(onBus: 0)
+                
+                self.recognitionRequest = nil
+                self.recognitionTask = nil
+                
+                self.recordButton.isEnabled = true
+            }
+        })
+        
+        let recordingFormat = inputNode.outputFormat(forBus: 0)
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { (buffer, when) in
+            self.recognitionRequest?.append(buffer)
+        }
+        
+        audioEngine.prepare()
+        
+        do {
+            try audioEngine.start()
+        } catch {
+            print("audioEngine couldn't start because of an error.")
+        }
+        
+        self.recordTextView.text = "Listening . . ."
+    }
+    
+    func speechRecognizer(_ speechRecognizer: SFSpeechRecognizer, availabilityDidChange available: Bool) {
+        if available {
+            recordButton.isEnabled = true
+        } else {
+            recordButton.isEnabled = false
+        }
+    }
+    
+    func sendStringMessage(message: String) {
+        let msg = StringMessage()
+        msg.data = message
+        stringPublisher?.publish(msg)
+    }
+    
 }
 
